@@ -1,0 +1,50 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- Configuración del joystick -->
+    <arg name="joy_dev" default="/dev/input/js0" />
+    <machine
+        name="rbp"  
+        address="172.30.0.247"  
+        user="ubuntu"  
+        password="nacho123" 
+        env-loader="/home/ubuntu/env.sh" 
+        default="true"  
+        />
+    <machine
+    name="local"
+    address="172.30.9.151"
+    user="daniel"
+    password="Ximena28"
+    />
+    <arg name="n1" default="1" />
+    <arg name="frame1" default="RB1" />
+    <!-- Nodo de VRPN para tracking -->
+      <!-- Argumento para la dirección IP del servidor VRPN (OptiTrack) -->
+    <arg name="server" default="192.168.2.10" />  <!-- Cambia esto por la IP de tu servidor VRPN -->
+
+    <!-- Nodo de VRPN Client para recibir datos de OptiTrack -->
+    <node pkg="vrpn_client_ros" type="vrpn_client_node" name="vrpn_client_node" output="screen">
+        <param name="server" value="$(arg server)" />  <!-- Dirección IP del servidor VRPN -->
+        <param name="port" value="3883" />              <!-- Puerto del servidor VRPN -->
+        <param name="update_frequency" value="100.0" /> <!-- Frecuencia de actualización -->
+        <param name="frame_id" value="world" />         <!-- Marco de referencia -->
+        <param name="use_server_time" value="false" />  <!-- Usar el tiempo de ROS -->
+        <param name="broadcast_tf" value="true" />      <!-- Publicar transformaciones TF -->
+        <param name="refresh_tracker_frequency" value="1.0" /> <!-- Frecuencia de actualización del tracker -->
+        <remap from="/vrpn_client_node/RB1/pose" to="/robot_position"/>
+    </node>
+    <!-- Nodo de generación de trayectorias -->
+    <node name="trayectory_generator" pkg="scripts" type="daniel.py" output="screen" machine="local">
+
+    </node>
+
+    <!-- Nodo de control del robot -->
+    <node name="robot_control" pkg="test" type="ctlomni.py" output="screen" machine="rbp">
+
+    </node>
+
+    <!-- Nodo de  motores -->
+    <node name="motor_control" pkg="test" type="motores.py" output="screen" machine="rbp">
+
+    </node>
+</launch>
