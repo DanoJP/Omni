@@ -4,23 +4,23 @@
     <arg name="joy_dev" default="/dev/input/js0" />
     <machine
         name="rbp"  
-        address="172.30.0.247"  
+        address="<IP RASPBERRY>"  
         user="ubuntu"  
-        password="nacho123" 
+        password="<PASWORD>" 
         env-loader="/home/ubuntu/env.sh" 
         default="true"  
         />
     <machine
     name="local"
-    address="172.30.9.151"
+    address="<IP ground station>"
     user="daniel"
-    password="Ximena28"
+    password="<pasword>"
     />
     <arg name="n1" default="1" />
     <arg name="frame1" default="RB1" />
     <!-- Nodo de VRPN para tracking -->
       <!-- Argumento para la dirección IP del servidor VRPN (OptiTrack) -->
-    <arg name="server" default="192.168.2.10" />  <!-- Cambia esto por la IP de tu servidor VRPN -->
+    <arg name="server" default="<IP optitrack>" />  <!-- Cambia esto por la IP de tu servidor VRPN -->
 
     <!-- Nodo de VRPN Client para recibir datos de OptiTrack -->
     <node pkg="vrpn_client_ros" type="vrpn_client_node" name="vrpn_client_node" output="screen">
