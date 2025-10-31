@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+
+import rospy
+from geometry_msgs.msg import PoseStamped
+import time
+import numpy as np
+import math
+import scipy.io
+import RPi.GPIO as GPIO
+from board import SCL, SDA
+import busio
+
+from adafruit_pca9685 import PCA9685
+
+# --- 1. CONFIGURACIÓN E INICIALIZACIÓN DE HARDWARE Y ROS ---
+
+# Create the I2C bus interface.
+i2c_bus = busio.I2C(SCL, SDA)
+
+# Create a simple PCA9685 class instance.
+pca = PCA9685(i2c_bus)
+
+# Set the PWM frequency to 1000hz.
+pca.frequency = 1000
+
+# Pines BCM
+in11 = 23
+in12 = 22
+in31 = 27
+in32 = 18
+in41 = 17
+in42 = 4
+
+# BCM Pin Mode
+GPIO.setmode(GPIO.BCM)
+
+# Motor Pin Configurations
+GPIO.setup(in11,GPIO.OUT)
+GPIO.setup(in12,GPIO.OUT)
+GPIO.setup(in31,GPIO.OUT)
+GPIO.setup(in32,GPIO.OUT)
+GPIO.setup(in41,GPIO.OUT)
+GPIO.setup(in42,GPIO.OUT)
+
+# --- 2. VARIABLES GLOBALES DE ESTADO Y DATOS ---
+
+mvol = 8 
+
+# Position Variable (actualizada por OptiTrack)
+p_x = 0.0
+p_y = 0.0
+p_z = 0.0 # Yaw angle
+
+# Para el registro de tiempo
+timestamps = []
+start_global_time = time.time() # Tiempo de inicio global del script
+
+# Variables globales para las ganancias
+global_Kpo_val = 0.0
+global_Kdo_val = 0.0
+
+# --- 3. FUNCIONES DE MOTOR, ORIENTACIÓN Y CALLBACK DE OPTITRACK ---
+
+def set_motor_pwm(motor_id, channel, speed_voltage):
+    """
+    Asigna dirección (GPIO) y velocidad (PWM) a un motor.
+    """
+    velocity_pwm = (np.abs(speed_voltage) * 65535) // 12 
+    pwm_val = int(min(velocity_pwm, 65535))
+
+    if motor_id == 1: # Motor 1 (Canal 0) - usa in11, in12
+        if speed_voltage >= 0:
+            GPIO.output(in11, False)
+            GPIO.output(in12, True)
+        else: # speed_voltage < 0
+            GPIO.output(in11, True)
+            GPIO.output(in12, False)
+    elif motor_id == 2: # Motor 2 (Canal 2) - usa in31, in32
+        if speed_voltage >= 0:
+            GPIO.output(in31, True) # Invertido respecto a Motor 1
+            GPIO.output(in32, False) # Invertido respecto a Motor 1
+        else: # speed_voltage < 0
+            GPIO.output(in31, False)
+            GPIO.output(in32, True)
+    elif motor_id == 3: # Motor 3 (Canal 3) - usa in41, in42
+        if speed_voltage >= 0:
+            GPIO.output(in41, True) # Invertido respecto a Motor 1
+            GPIO.output(in42, False) # Invertido respecto a Motor 1
+        else: # speed_voltage < 0
+            GPIO.output(in41, False)
+            GPIO.output(in42, True)
+    else:
+        rospy.logwarn(f"Advertencia: Motor ID {motor_id} no reconocido. Deteniendo motor.")
+        pca.channels[channel].duty_cycle = 0
+        return
+        
+    pca.channels[channel].duty_cycle = pwm_val
+
+def get_yaw_from_quaternion(q_x, q_y, q_z, q_w):
+    t3 = 2*(q_w*q_z+q_x*q_y)
+    t4 = 1-2*(q_y*q_y+q_z*q_z)
+    yaw_z = math.atan2(t3,t4)
+    return yaw_z
+
+def callback(data):
+    global p_x, p_y, p_z
+    p_x =-data.pose.position.z
+    p_y =-data.pose.position.x
+    q_x = data.pose.orientation.x
+    q_y = data.pose.orientation.y
+    q_z = data.pose.orientation.z
+    q_w = data.pose.orientation.w
+    p_z = get_yaw_from_quaternion(q_x,q_y,q_z,q_w)
+
+# --- 4. BUCLE PRINCIPAL DE CONTROL main_loop ---
+
+def main_loop():
+    global p_x, p_y, p_z, start_global_time, global_Kpo_val, global_Kdo_val
+
+    # 1. Parámetros del sistema (de tu simulación MATLAB)
+    mR=1.99
+    mR1=0.29
+    IRz=6.0848e-2
+    IRy1=3.24e-4
+    IRz1=4.69e-4
+    r=0.05 
+    Jm=5.7e-7
+    kb=0.01336e-3 
+    ka=0.0134
+    Ra=1.9
+    kv=0.0001 
+    re= 64 
+    L=.11
+
+    # Matrices dinámicas
+    E=-(1/r)*np.array([
+        [np.sqrt(3)/2, -1/2, -L],
+        [0, 1, -L],
+        [-np.sqrt(3)/2, -1/2, -L]
+    ]).T # Transpuesto para coincidir con tu MATLAB
+
+    B = -np.array([[0, -1, 0],
+                  [1, 0, 0],
+                  [0, 0, 0]])
+
+    mR11 = mR + 3 * mR1
+    mR33 = 3 * mR1 * L**2 + IRz + 3 * IRz1
+    MR= np.array([[mR11,0,0],[0,mR11,0],[0,0,mR33]])
+
+    M=MR+((IRy1+Jm*re**2)*(E.T @ E)) # E.T es la transpuesta de E
+    D=re**2*(ka*kb/Ra+kv)*(E.T @ E)
+    G = np.linalg.inv(M)
+
+    # Simulation variables
+    dura = 20 # Simulation length in seconds
+    h = 0.006 # Step size (de tu MATLAB)
+    t = np.arange(0,dura+h,h) # Time variable
+    j = int(np.size(t)) # Size of time vector
+    ite = np.arange(0,j,1)
+    
+    # States initialization
+    x = np.zeros((3,j+1)) # Position (Medida por OptiTrack)
+    xp = np.zeros((3,j+1)) # Velocity (estimada directamente)
+    
+    # Desired trajectory - ahora se calcula en tiempo real
+    xd = np.zeros((3,j)) # Desired position
+    xdp = np.zeros((3,j)) # Desired velocity
+    xdpp = np.zeros((3,j)) # Desired acceleration
+    
+    # Errors
+    e = np.zeros((3,j)) # Tracking error position
+    ep = np.zeros((3,j)) # Tracking error velocity (respecto a la velocidad real estimada)
+
+    # Inicialización matrices R, C, F
+    R_mat = np.zeros((3,3,j)) # Renombrado a R_mat para evitar conflicto con RPi.GPIO
+    C = np.zeros((3,3,j))
+    F = np.zeros((3,j))
+
+    # Initializing control variables
+    tau = np.zeros((3,j)) # Computed torque
+    u = np.zeros((3,j)) # Motor voltages
+
+    # Parámetros de la trayectoria sinusoidal
+    amplitude_x = 0.5  # Amplitud en metros para eje X
+    amplitude_y = 0.3  # Amplitud en metros para eje Y
+    frequency = 0.2    # Frecuencia en Hz
+    omega = 2 * np.pi * frequency  # Frecuencia angular
+
+    # Ganancias del controlador (Usando los valores ingresados por el usuario)
+    Kpo = global_Kpo_val * np.eye(3)
+    Kdo = global_Kdo_val * np.eye(3)
+    
+    rospy.loginfo(f"Ganancias Kpo: \n{Kpo}\nGanancias Kdo: \n{Kdo}")
+    rospy.loginfo(f"Trayectoria sinusoidal: A_x={amplitude_x}m, A_y={amplitude_y}m, f={frequency}Hz")
+
+    rospy.loginfo("Iniciando bucle de control con trayectoria sinusoidal...")
+    rate = rospy.Rate(1/h) # h es el paso de tiempo, 1/h es la frecuencia en Hz
+
+    for i in ite:
+        if rospy.is_shutdown():
+            break
+
+        # Tiempo actual para la trayectoria
+        current_time = t[i]
+        
+        # 1. Leer la posición actual de OptiTrack
+        x[0][i] = p_x
+        x[1][i] = p_y
+        x[2][i] = p_z
+
+        # 2. Estimación de velocidad actual (derivando la posición)
+        if i > 0:
+            xp[:,i] = (x[:,i] - x[:,i-1]) / h
+        else:
+            xp[:,i] = np.array([0.0, 0.0, 0.0]) # Velocidad inicial cero
+
+        # 3. Calcular trayectoria deseada SINUSOIDAL en tiempo real
+        # Trayectoria sinusoidal para X e Y, orientación fija en 0
+        xd[0][i] = amplitude_x * math.sin(omega * current_time)
+        xd[1][i] = amplitude_y * math.cos(omega * current_time) 
+        xd[2][i] = 0.0  # Orientación deseada fija
+        
+        # Velocidades deseadas (derivadas)
+        xdp[0][i] = amplitude_x * omega * math.cos(omega * current_time)
+        xdp[1][i] = -amplitude_y * omega * math.sin(omega * current_time)
+        xdp[2][i] = 0.0
+        
+        # Aceleraciones deseadas (segundas derivadas)
+        xdpp[0][i] = -amplitude_x * omega**2 * math.sin(omega * current_time)
+        xdpp[1][i] = -amplitude_y * omega**2 * math.cos(omega * current_time)
+        xdpp[2][i] = 0.0
+
+        # 4. Calcular errores de seguimiento (posición y velocidad)
+        e[:,i] = xd[:,i] - x[:,i] # epsilon pi
+        ep[:,i] = xdp[:,i] - xp[:,i] # epsilon vi
+
+        # 5. Matrices necesarias para el control (usan x[2][i] para orientación actual, xp[2][i] para velocidad angular)
+        R_mat[:,:,i]= [[ math.cos(x[2][i]) , math.sin(x[2][i]) , 0],
+                       [-math.sin(x[2][i]) , math.cos(x[2][i]) , 0],
+                       [ 0 , 0 , 1]]
+
+        C[:,:,i]= 2/(r**2)*(IRy1+Jm*re**2)*xp[2][i]*B 
+        F[:,i]=-np.linalg.inv(M) @ ((C[:,:,i]+D) @ xp[:,i]) # El @ es para multiplicación de matrices en numpy
+        
+        c_d = 0.0 # Constant perturbation, como en tu MATLAB
+
+        # 6. Controlador (Basado en MATLAB)
+        u2 = Kpo @ e[:,i] + Kdo @ ep[:,i]
+        
+        # Cálculo de tau (torque)
+        tau[0,i] = -(1/G[0,0]) * (F[0,i] - xdpp[0,i] + u2[0] + c_d)
+        tau[1,i] = -(1/G[1,1]) * (F[1,i] - xdpp[1,i] + u2[1] + c_d)
+        tau[2,i] = -(1/G[2,2]) * (F[2,i] - xdpp[2][i] + u2[2] + c_d)
+
+        # 7. Conversión de Torque/Fuerza (tau) a Voltajes de Motor (u)
+        u[:,i] = (Ra/(ka*re)) * np.linalg.inv(E) @ np.linalg.inv(R_mat[:,:,i].T) @ tau[:,i]
+
+        # 8. Saturación de Voltajes de Motor y Envío a PWM
+        u11 = round(u[0,i],2)
+        u22 = round(u[1,i],2)
+        u33 = round(u[2,i],2)
+
+        if np.abs(u11) > mvol:
+            u11 = mvol*np.sign(u11)
+        if np.abs(u22) > mvol:
+            u22 = mvol*np.sign(u22)
+        if np.abs(u33) > mvol:
+            u33 = mvol*np.sign(u33)
+        
+        set_motor_pwm(1, 0, u11)
+        set_motor_pwm(2, 2, u22)
+        set_motor_pwm(3, 3, u33)
+        
+        # Log cada 100 iteraciones para no saturar
+        if i % 100 == 0:
+            rospy.loginfo(f"Tiempo: {current_time:.2f}s | Posición: ({x[0][i]:.3f}, {x[1][i]:.3f}) | Deseada: ({xd[0][i]:.3f}, {xd[1][i]:.3f})")
+        
+        rate.sleep()
+
+    rospy.loginfo("Bucle de control finalizado.")
+
+    # --- 5. Guardado de Datos ---
+    
+    scipy.io.savemat('datos_robot_sinusoidal_control.mat', {
+        'time_vec': t,
+        'xd': xd[:, :j],
+        'x_opti': x[:, :j], # Posición real medida por OptiTrack
+        'xp_est_direct': xp[:, :j], # Velocidad estimada directamente
+        'e_pos_track': e, # Error de seguimiento de posición
+        'e_vel_track': ep, # Error de seguimiento de velocidad
+        'u_voltajes': u[:, :j], # Voltajes de control
+        'tau_torque': tau, # Torque calculado
+        'F_term': F,
+        'R_rot_mat': R_mat
+    })
+    rospy.loginfo("Datos completos guardados en datos_robot_sinusoidal_control.mat")
+
+# --- Función para detener todos los motores ---
+def stop_motors():
+    rospy.loginfo("Deteniendo motores...")
+    pca.channels[0].duty_cycle = 0
+    pca.channels[2].duty_cycle = 0
+    pca.channels[3].duty_cycle = 0
+    GPIO.output(in11, False)
+    GPIO.output(in12, False)
+    GPIO.output(in31, False)
+    GPIO.output(in32, False)
+    GPIO.output(in41, False)
+    GPIO.output(in42, False)
+
+# --- 6. INICIO DEL NODO ROS Y EJECUCIÓN DEL BUCLE PRINCIPAL ---
+
+if __name__ == "__main__":
+    rospy.init_node("control_robot_omnidireccional_sinusoidal_control")
+    rospy.Subscriber("vrpn_client_node/RB1/pose", PoseStamped, callback)
+
+    # Solicitar las ganancias al usuario
+    while True:
+        try:
+            input_kpo = input("Introduce el valor para Kpo_val (ej. 2.5): ")
+            global_Kpo_val = float(input_kpo)
+            break
+        except ValueError:
+            print("Entrada inválida. Por favor, introduce un número.")
+    
+    while True:
+        try:
+            input_kdo = input("Introduce el valor para Kdo_val (ej. 2.5): ")
+            global_Kdo_val = float(input_kdo)
+            break
+        except ValueError:
+            print("Entrada inválida. Por favor, introduce un número.")
+
+    rospy.loginfo("Esperando datos del VRPN para inicializar el control...")
+    timeout_start = time.time()
+    # Esperar hasta 10 segundos para recibir los primeros datos de OptiTrack
+    while (time.time() - timeout_start < 10) and (p_x == 0.0 and p_y == 0.0 and p_z == 0.0) and not rospy.is_shutdown():
+        time.sleep(0.1)
+    
+    if (p_x == 0.0 and p_y == 0.0 and p_z == 0.0):
+        rospy.logerr("ERROR: No se recibieron datos de OptiTrack. Asegúrate de que el VRPN esté funcionando y el tema sea correcto.")
+        # Si el programa termina aquí por falta de datos, limpiar GPIO
+        GPIO.cleanup() 
+    else:
+        time.sleep(1.0) # Pequeña pausa adicional después de recibir los datos
+
+        try:
+            main_loop()
+        except rospy.ROSInterruptException:
+            rospy.loginfo("ROS interrupción detectada. Deteniendo el control.")
+        finally:
+            stop_motors() # Se detienen los motores
+            GPIO.cleanup() # Y aquí se limpia GPIO, ¡solo una vez al final de todo!
+            rospy.loginfo("Programa finalizado y motores detenidos. ¡Adiós! 👋")
