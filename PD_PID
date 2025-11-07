@@ -11,8 +11,7 @@ from board import SCL, SDA
 import busio
 
 from adafruit_pca9685 import PCA9685
-# Ya no necesitamos tf.transformations directamente para shortest_angular_distance
-# import tf.transformations 
+ 
 
 # --- 1. CONFIGURACIÓN E INICIALIZACIÓN DE HARDWARE Y ROS ---
 
