@@ -11,7 +11,11 @@ from board import SCL, SDA
 import busio
 
 from adafruit_pca9685 import PCA9685
- 
+
+# --- Importaciones adicionales para la entrada de usuario no bloqueante ---
+import sys
+import select
+# --------------------------------------------------------------------------
 
 # --- 1. CONFIGURACIÓN E INICIALIZACIÓN DE HARDWARE Y ROS ---
 
@@ -54,7 +58,7 @@ p_z = 0.0 # Yaw angle (raw, in [-pi, pi])
 
 # NUEVAS VARIABLES GLOBALES PARA MANEJAR EL YAW
 p_z_prev = 0.0 # Almacena el yaw anterior (raw) para el cálculo de unwrapped
-p_z_unwrapped = 0.0 # Yaw acumulado que no salta 2*pi
+p_z_unwrapped = 0.0 # Yaw acumulado que no salta 2*pi (AHORA SEGUIRÁ A p_z DIRECTAMENTE)
 last_callback_time = 0.0 # Para ayudar a inicializar el unwrapped_yaw
 
 # Para el registro de tiempo
@@ -137,21 +141,24 @@ def callback(data):
     
     current_raw_yaw = get_yaw_from_quaternion(q_x, q_y, q_z, q_w)
     
-    if last_callback_time != 0.0:
-        yaw_diff = current_raw_yaw - p_z_prev
+    # --- COMENTADO: Lógica para "desenvolver" el yaw para que no se reinicie ---
+    # if last_callback_time != 0.0:
+    #     yaw_diff = current_raw_yaw - p_z_prev
 
-        # Normalizar yaw_diff para que esté en [-pi, pi]
-        # Esto maneja los cruces de pi a -pi o viceversa
-        if yaw_diff > np.pi:
-            yaw_diff -= 2 * np.pi
-        elif yaw_diff < -np.pi:
-            yaw_diff += 2 * np.pi
+    #     # Normalizar yaw_diff para que esté en [-pi, pi]
+    #     if yaw_diff > np.pi:
+    #         yaw_diff -= 2 * np.pi
+    #     elif yaw_diff < -np.pi:
+    #         yaw_diff += 2 * np.pi
         
-        p_z_unwrapped += yaw_diff
-    else:
-        # Inicializar p_z_unwrapped con el primer yaw recibido
-        p_z_unwrapped = current_raw_yaw
+    #     p_z_unwrapped += yaw_diff
+    # else:
+    #     # Inicializar p_z_unwrapped con el primer yaw recibido
+    #     p_z_unwrapped = current_raw_yaw
+    # --------------------------------------------------------------------------
     
+    # Si la lógica de unwrapping está comentada, p_z_unwrapped simplemente seguirá a p_z
+    p_z_unwrapped = current_raw_yaw # p_z_unwrapped ahora es simplemente el yaw raw
     p_z = current_raw_yaw # p_z se mantiene como el yaw en [-pi, pi]
     p_z_prev = current_raw_yaw
     last_callback_time = current_callback_time
@@ -161,7 +168,7 @@ def callback(data):
 def main_loop():
     global p_x, p_y, p_z, p_z_unwrapped, start_global_time, global_Kpo_val, global_Kdo_val
 
-    # 1. Parámetros del sistema (de tu simulación MATLAB)
+    # 1. Parámetros del sistema 
     mR=1.99
     mR1=0.29
     IRz=6.0848e-2
@@ -196,8 +203,8 @@ def main_loop():
     G = np.linalg.inv(M)
 
     # Simulation variables
-    dura = 20 # Simulation length in seconds
-    h = 0.006 # Step size (de tu MATLAB)
+    dura = 50 # Simulation length in seconds
+    h = 0.006 # Step size 
     t = np.arange(0,dura+h,h) # Time variable
     j = int(np.size(t)) # Size of time vector
     ite = np.arange(0,j,1)
@@ -206,11 +213,28 @@ def main_loop():
     x = np.zeros((3,j+1)) # Position (Medida por OptiTrack)
     xp = np.zeros((3,j+1)) # Velocity (estimada directamente)
     
-    # Desired trajectory - ahora se calcula en tiempo real
+    # Desired trajectory 
     xd = np.zeros((3,j)) # Desired position
     xdp = np.zeros((3,j)) # Desired velocity
     xdpp = np.zeros((3,j)) # Desired acceleration
     
+    # --- Trayectoria deseada fuera del bucle for ---
+    a  = 0.5                        #Signal aplitud x and y
+    w1  = 2*math.pi*0.05           #Velocity for x and y
+    w2 = 0.5*math.pi*0.05         #Angular velocity for angle theta
+    xd[0] =a*np.sin(w1*t)
+    xd[1] =a*np.cos(w1*t)
+    xd[2] =-w2*t
+        
+    xdp[0] =a*w1*np.cos(w1*t)
+    xdp[1] =-a*w1*np.sin(w1*t)
+    xdp[2] =-w2
+        
+    xdpp[0] =-a*w1*w1*np.sin(w1*t)
+    xdpp[1] =-a*w1*w1*np.cos(w1*t)
+    xdpp[2] = 0
+    # -----------------------------------------------
+
     # Errors
     e = np.zeros((3,j)) # Tracking error position
     ep = np.zeros((3,j)) # Tracking error velocity (respecto a la velocidad real estimada)
@@ -225,13 +249,13 @@ def main_loop():
     tau = np.zeros((3,j)) # Computed torque
     u = np.zeros((3,j)) # Motor voltages
 
-    # Parámetros de la trayectoria sinusoidal
+    # Parámetros de la trayectoria sinusoidal (solo para referencia en logs, ya generada arriba)
     amplitude_x = 0.5  # Amplitud en metros para eje X
     amplitude_y = 0.3  # Amplitud en metros para eje Y
     frequency = 0.2    # Frecuencia en Hz
     omega = 2 * np.pi * frequency  # Frecuencia angular
 
-    #Ganancias Orientacion obtenidas en Matlab
+    #Ganancias Orientacion obtenidas en 
     Ki_th = -3.15#Kth[0, 0]
     Kp_th = -6.75#Kth[0, 1]
     Kd_th = -4.6 #Kth[0, 2]
@@ -256,33 +280,20 @@ def main_loop():
         # 1. Leer la posición actual de OptiTrack
         x[0][i] = p_x
         x[1][i] = p_y
-        x[2][i] = p_z_unwrapped # ¡Usamos el yaw desenvuelto aquí!
+        x[2][i] = p_z_unwrapped # ¡Usamos el yaw desenvuelto aquí (o raw si el unwrapping está comentado)!
 
         # 2. Estimación de velocidad actual (derivando la posición)
-        # Esto ahora es mucho más estable para el yaw
         if i > 0:
             xp[:,i] = (x[:,i] - x[:,i-1]) / h
         else:
             xp[:,i] = np.array([0.0, 0.0, 0.0]) # Velocidad inicial cero
 
-        # 3. Calcular trayectoria deseada SINUSOIDAL en tiempo real
-        xd[0][i] = amplitude_x * math.sin(omega * current_time)
-        xd[1][i] = amplitude_y * math.cos(omega * current_time) 
-        xd[2][i] = 0.0  # Orientación deseada fija (asegúrate de que sea 0 o un valor constante)
-        
-        xdp[0][i] = amplitude_x * omega * math.cos(omega * current_time)
-        xdp[1][i] = -amplitude_y * omega * math.sin(omega * current_time)
-        xdp[2][i] = 0.0
-        
-        xdpp[0][i] = -amplitude_x * omega**2 * math.sin(omega * current_time)
-        xdpp[1][i] = -amplitude_y * omega**2 * math.cos(omega * current_time)
-        xdpp[2][i] = 0.0
 
         # 4. Calcular errores de seguimiento (posición y velocidad)
         e[0,i] = xd[0,i] - x[0,i]
         e[1,i] = xd[1,i] - x[1,i]
         # ERROR DE ORIENTACIÓN: Usar nuestra función shortest_angular_distance para el yaw
-        e[2,i] = shortest_angular_distance(x[2,i], xd[2,i]) # ¡Cambio aquí!
+        e[2,i] = shortest_angular_distance(x[2,i], xd[2][i]) 
         
         ei[:, i+1] = ei[:, i] + h * e[:, i] 
         ep[:,i] = xdp[:,i] - xp[:,i]
@@ -292,7 +303,6 @@ def main_loop():
         epm = ep[:2, i].reshape(2, 1) 
 
         # 5. Matrices necesarias para el control (usan x[2][i] para orientación actual, xp[2][i] para velocidad angular)
-        # R_mat sigue usando x[2][i] (que ahora es el yaw desenvuelto)
         R_mat[:,:,i]= [[ math.cos(x[2][i]) , math.sin(x[2][i]) , 0],
                        [-math.sin(x[2][i]) , math.cos(x[2][i]) , 0],
                        [ 0 , 0 , 1]]
@@ -300,7 +310,7 @@ def main_loop():
         C[:,:,i]= 2/(r**2)*(IRy1+Jm*re**2)*xp[2][i]*B 
         F[:,i]=-np.linalg.inv(M) @ ((C[:,:,i]+D) @ xp[:,i]) # El @ es para multiplicación de matrices en numpy
         
-        c_d = 0.0 # Constant perturbation, como en tu MATLAB
+        c_d = 0.0 # Constant perturbation, 
         um = Kpo @ em + Kdo @ epm
         uth = Ki_th * ei[2, i+1] + Kp_th * e[2, i] + Kd_th * ep[2, i]
         # 6. Controlador 
@@ -330,11 +340,7 @@ def main_loop():
         set_motor_pwm(2, 2, u22)
         set_motor_pwm(3, 3, u33)
         
-        # Log cada 100 iteraciones para no saturar
-        if i % 100 == 0:
-            rospy.loginfo(f"Tiempo: {current_time:.2f}s | Posición: ({x[0][i]:.3f}, {x[1][i]:.3f}) | Orientación (desenvuelta): {x[2][i]:.3f} rad | Deseada: ({xd[0][i]:.3f}, {xd[1][i]:.3f}, {xd[2][i]:.3f} rad)")
-            rospy.loginfo(f"Errores (pos, vel, yaw): ({e[0,i]:.3f}, {e[1,i]:.3f}, {e[2,i]:.3f})")
-
+        # La salida de log detallada durante el control está deshabilitada
         rate.sleep()
 
     rospy.loginfo("Bucle de control finalizado.")
@@ -344,7 +350,7 @@ def main_loop():
     scipy.io.savemat('datos_robot_sinusoidal_control.mat', {
         'time_vec': t,
         'xd': xd[:, :j],
-        'x_opti': x[:, :j], # Posición real medida por OptiTrack (yaw desenvuelto)
+        'x_opti': x[:, :j], # Posición real medida por OptiTrack (yaw desenvuelto o raw)
         'p_z_raw': p_z, # Puedes guardar el yaw raw también si quieres analizarlo
         'xp_est_direct': xp[:, :j], # Velocidad estimada directamente
         'e_pos_track': e, # Error de seguimiento de posición
@@ -375,27 +381,9 @@ if __name__ == "__main__":
     rospy.init_node("control_robot_omnidireccional_sinusoidal_control")
     rospy.Subscriber("vrpn_client_node/RB1/pose", PoseStamped, callback)
 
-    # Solicitar las ganancias al usuario
-    while True:
-        try:
-            input_kpo = input("Introduce el valor para Kpo_val (ej. 2.5): ")
-            global_Kpo_val = float(input_kpo)
-            break
-        except ValueError:
-            print("Entrada inválida. Por favor, introduce un número.")
-    
-    while True:
-        try:
-            input_kdo = input("Introduce el valor para Kdo_val (ej. 2.5): ")
-            global_Kdo_val = float(input_kdo)
-            break
-        except ValueError:
-            print("Entrada inválida. Por favor, introduce un número.")
-
-    rospy.loginfo("Esperando datos del VRPN para inicializar el control...")
+    rospy.loginfo("Esperando datos de OptiTrack para inicializar...")
     timeout_start = time.time()
-    # Esperar hasta 10 segundos para recibir los primeros datos de OptiTrack
-    # IMPORTANTE: La inicialización de p_z_unwrapped ahora ocurre en el primer callback
+    # Esperar hasta que se reciban los primeros datos de OptiTrack
     while (time.time() - timeout_start < 10) and (last_callback_time == 0.0) and not rospy.is_shutdown():
         time.sleep(0.1)
     
@@ -403,7 +391,55 @@ if __name__ == "__main__":
         rospy.logerr("ERROR: No se recibieron datos de OptiTrack. Asegúrate de que el VRPN esté funcionando y el tema sea correcto.")
         GPIO.cleanup() 
     else:
-        time.sleep(1.0) # Pequeña pausa adicional después de recibir los datos
+        rospy.loginfo(f"¡Datos de OptiTrack recibidos!")
+        rospy.loginfo(f"La trayectoria deseada tiene una orientación final de 0.0 radianes.")
+        rospy.loginfo(f"Por favor, ajuste manualmente el robot para que su orientación sea cercana a 0.0 rad.")
+        rospy.loginfo(f"La orientación actual se actualizará cada 3 segundos. Pulsa Enter para continuar con el control.")
+        
+        # Bucle para mostrar la orientación cada 3 segundos hasta que se presione Enter
+        last_display_time = time.time()
+        # Configurar stdin para no bloquear
+        import termios, tty
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(sys.stdin.fileno())
+            while not rospy.is_shutdown():
+                if (time.time() - last_display_time) >= 3.0:
+                    rospy.loginfo(f"Orientación actual del robot (Yaw, en radianes [-pi, pi]): {p_z:.3f}")
+                    last_display_time = time.time()
+                
+                # Comprobar si hay entrada (una pulsación de tecla, no solo Enter)
+                if select.select([sys.stdin], [], [], 0)[0]:
+                    char = sys.stdin.read(1) # Lee un solo carácter
+                    if char == '\n' or char == '\r': # Si se presiona Enter
+                        break
+                
+                time.sleep(0.1) # Pequeña pausa para no saturar la CPU
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            # Imprime una nueva línea después de salir del modo raw para que la terminal se vea bien
+            print("\r\n", end="") 
+
+
+        # Solicitar las ganancias al usuario
+        while True:
+            try:
+                input_kpo = input("Introduce el valor para Kpo_val (ej. 2.5): ")
+                global_Kpo_val = float(input_kpo)
+                break
+            except ValueError:
+                print("Entrada inválida. Por favor, introduce un número.")
+        
+        while True:
+            try:
+                input_kdo = input("Introduce el valor para Kdo_val (ej. 2.5): ")
+                global_Kdo_val = float(input_kdo)
+                break
+            except ValueError:
+                print("Entrada inválida. Por favor, introduce un número.")
+
+        time.sleep(1.0) # Pequeña pausa adicional antes de iniciar el control
 
         try:
             main_loop()
